@@ -1,5 +1,7 @@
 # Korean Law MCP
 
+> **로컬 사용 브랜치 안내:** `local/stdio-hardening`의 `4.15.14-local.1`은 체크아웃한 소스를 빌드해 STDIO로 실행하는 버전입니다. 설치·개인 OC 설정·Codex 연결은 [로컬 사용 가이드](docs/LOCAL-USE.md)를 따르세요. 아래의 공개 서버·npm·Claude 플러그인 안내는 원본 프로젝트의 배포 경로입니다.
+
 **법제처 42개 API를 10개 도구로.** 법령·판례·행정규칙·자치법규·조약·해석례(국세청 포함) 조회와 **AI 답변의 인용 검증**을 AI 어시스턴트나 터미널에서 바로 사용.
 
 [![npm version](https://img.shields.io/npm/v/korean-law-mcp.svg)](https://www.npmjs.com/package/korean-law-mcp)

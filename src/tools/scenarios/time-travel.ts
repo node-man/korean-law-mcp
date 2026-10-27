@@ -11,14 +11,14 @@
  */
 import type { ScenarioContext, ScenarioResult, ScenarioSection } from "./types.js"
 import type { HistoricalVersion } from "../../lib/historical-utils.js"
-import { fetchLawVersions, sameLawName, wholeRevisionLabel, wholeRevisionsBetween } from "../../lib/law-lineage.js"
+import { fetchLawVersions, lawStateAt, sameLawName, wholeRevisionLabel, wholeRevisionsBetween } from "../../lib/law-lineage.js"
 import { dateSchema } from "../../lib/schemas.js"
 import {
   changeExcerpt, diffArticles, displayJo, dot, excerptBudget, extractLawSnapshot,
   type ArticleSnapshot, type LawSnapshot,
 } from "./time-travel-diff.js"
 
-/** efYd <= targetDate 중 가장 큰 (해당 시점 시행 버전) */
+/** efYd <= targetDate 중 가장 큰 연혁 행. 폐지 여부는 선택 뒤 lawStateAt으로 구분한다. */
 export function pickVersion(versions: HistoricalVersion[], targetDate: string): HistoricalVersion | undefined {
   const target = parseInt(targetDate, 10)
   if (isNaN(target)) return undefined
@@ -116,6 +116,37 @@ export async function runTimeTravelScenario(ctx: ScenarioContext): Promise<Scena
 
   const oldVer = pickVersion(versions, fromDate)
   const newVer = pickVersion(versions, toDate)
+
+  // 연혁의 폐지 행도 MST·시행일을 갖지만 시행 중인 판본은 아니다. 동일 판본
+  // 단축 경로와 본문 diff 전에 상태를 확인한다. 선택한 한 행을 넘겨 기존의
+  // 시행일 정렬·동일일자 재제정 우선순위·분리시행 선택은 그대로 유지한다.
+  const oldState = lawStateAt(oldVer ? [oldVer] : [], fromDate)
+  const newState = lawStateAt(newVer ? [newVer] : [], toDate)
+  if (oldState.repeal || newState.repeal) {
+    const statusLine = (label: string, date: string, ver?: HistoricalVersion, repeal?: HistoricalVersion) => {
+      const prefix = `시점 ${label}: ${dot(date)} 기준 | `
+      if (repeal) {
+        return `${prefix}폐지 상태 | ${dot(repeal.efYd)} ${repeal.rrCls} | MST ${repeal.mst}` +
+          (repeal.ancNo ? ` | 공포 제${repeal.ancNo}호` : "")
+      }
+      return ver?.efYd
+        ? `${prefix}시행 중 | ${dot(ver.efYd)} 시행 | MST ${ver.mst}`
+        : `${prefix}시행 중 판본을 연혁에서 확인하지 못했습니다.`
+    }
+    sections.push({
+      title: `Time Travel — ${lawName} (${fromDate} ↔ ${toDate})`,
+      content: [
+        statusLine("A", fromDate, oldVer, oldState.repeal),
+        statusLine("B", toDate, newVer, newState.repeal),
+        oldState.repeal && newState.repeal
+          ? "두 시점 모두 연혁상 폐지 상태입니다. 시행 중인 판본 간 조문 비교 대상이 없습니다."
+          : "연혁상 폐지 상태인 시점이 포함되어, 시행 중인 판본 간 조문 비교를 제공할 수 없습니다.",
+        "⚠️ 구체적 사안에 종전 규정이 적용되는지는 폐지 부칙·경과조치를 확인하세요.",
+      ].join("\n"),
+    })
+    suggestedActions.push(`${lawName} 폐지 부칙·경과조치`, `${lawName} 조문별 개정이력`)
+    return { sections, suggestedActions }
+  }
 
   if (!oldVer || !newVer) {
     const earliest = versions[versions.length - 1]

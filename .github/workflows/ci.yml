@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'local/**']
   pull_request:
     branches: [main]
 
@@ -17,7 +17,7 @@ jobs:
       matrix:
         # 20.19.0 = package.json engines 하한(통합호스트 gomdori-mcp 런타임),
         # 22.12.0 = 이 레포 Dockerfile 이 싣는 버전. 둘 다 실제로 돌려야 한다.
-        node-version: [20.19.0, 22.12.0]
+        node-version: [20.19.0, 22.12.0, 24]
 
     steps:
       # v4 (current tag target at time of pinning)
@@ -40,6 +40,9 @@ jobs:
 
       - name: Test
         run: npm test
+
+      - name: Verify local STDIO connection
+        run: npm run smoke:local
 
       - name: Verify packed artifact
         run: npm run verify:package

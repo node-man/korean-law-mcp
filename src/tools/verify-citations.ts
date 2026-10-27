@@ -18,7 +18,8 @@
 import { z } from "zod"
 import type { LawApiClient } from "../lib/api-client.js"
 import { buildJO } from "../lib/law-parser.js"
-import { findLaws, findRepealedLaw, looseMatchLawName, INTERPUNCT_CHARS, type LawInfo } from "../lib/law-search.js"
+import { findLaws, findRepealedLaw, INTERPUNCT_CHARS, type LawInfo } from "../lib/law-search.js"
+import { normalizeLawSearchText, resolveLawAlias } from "../lib/search-normalizer.js"
 import { parseHangNumber } from "../lib/article-parser.js"
 import { truncateResponse } from "../lib/schemas.js"
 import { formatToolError } from "../lib/errors.js"
@@ -45,13 +46,15 @@ interface ParsedCitation {
   joBranch?: number
   hang?: number
   ho?: number
+  hoBranch?: number
+  mok?: string
   joCode: string
   displayArticle: string
   claimTitle?: string
 }
 
 // 조문 인용 패턴 — "제N조", "제N조의M", "제N조 제K항 제L호"
-const ARTICLE_REGEX = /제\s*(\d+)\s*조(?:\s*의\s*(\d+))?(?:\s*제\s*(\d+)\s*항)?(?:\s*제\s*(\d+)\s*호)?/g
+const ARTICLE_REGEX = /제\s*(\d+)\s*조(?:\s*의\s*(\d+))?(?:\s*제\s*(\d+)\s*항)?(?:\s*제\s*(\d+)\s*호(?:\s*의\s*(\d+))?)?(?:\s*([가-힣])\s*목(?=$|[^가-힣]|(?:에|의|을|은|이|과|으로|부터|까지|도|만)))?/g
 
 // 조문 인용 직전 30자에서 법령명 스캔 — "XX법/법률/시행령/시행규칙/규칙/규정/조례"로 끝나는 것.
 // 가운뎃점은 INTERPUNCT_CHARS 전체를 허용 — 일부만 넣으면 '표시‧광고에 관한 법률'이
@@ -169,7 +172,7 @@ export function parseCitations(text: string, maxCitations: number): ParsedCitati
   ARTICLE_REGEX.lastIndex = 0
   let m: RegExpExecArray | null
   while ((m = ARTICLE_REGEX.exec(text)) !== null && citations.length < maxCitations) {
-    const [raw, joStr, branchStr, hangStr, hoStr] = m
+    const [raw, joStr, branchStr, hangStr, hoStr, hoBranchStr, mok] = m
     if (!joStr) continue
 
     // 직전 30자에서 법령명 역추적 (직전 인용 뒤로만)
@@ -207,13 +210,13 @@ export function parseCitations(text: string, maxCitations: number): ParsedCitati
       continue
     }
 
-    const key = `${(lawName || "_").toLowerCase()}::${joCode}::${hangStr || ""}::${hoStr || ""}`
-    if (seen.has(key)) continue
-    seen.add(key)
-
     // 조문 번호 바로 뒤 "(제목)" 캡처 — 내용검증(matchCitationContent)용
     const afterIdx = m.index + raw.length
     const claimTitle = extractClaimTitle(text.slice(afterIdx, afterIdx + 45))
+    // 같은 조문도 제목 주장이 다르면 별개 검증 대상이다. 조회는 VerifyMemo로 공유한다.
+    const key = JSON.stringify([lawName || "_", joCode, hangStr || "", hoStr || "", hoBranchStr || "", mok || "", claimTitle || ""])
+    if (seen.has(key)) continue
+    seen.add(key)
 
     citations.push({
       raw: raw.trim(),
@@ -222,6 +225,8 @@ export function parseCitations(text: string, maxCitations: number): ParsedCitati
       joBranch,
       hang: hangStr ? parseInt(hangStr, 10) : undefined,
       ho: hoStr ? parseInt(hoStr, 10) : undefined,
+      hoBranch: hoBranchStr ? parseInt(hoBranchStr, 10) : undefined,
+      mok,
       joCode,
       displayArticle,
       claimTitle,
@@ -239,9 +244,22 @@ function formatYmd(ymd?: string): string {
 function formatCitationLabel(c: ParsedCitation, officialName?: string): string {
   const name = officialName || c.lawName || "(법령명 미지정)"
   let label = `${name} ${c.displayArticle}`
-  if (c.hang) label += ` 제${c.hang}항`
-  if (c.ho) label += ` 제${c.ho}호`
+  if (c.hang !== undefined) label += ` 제${c.hang}항`
+  if (c.ho !== undefined) label += ` 제${c.ho}호${c.hoBranch ? `의${c.hoBranch}` : ""}`
+  if (c.mok) label += ` ${c.mok}목`
   return label
+}
+
+/** 검색 폴백의 접두 일치는 인용의 동일성 증거가 아니다. 명시적 약칭만 풀고 법·시행령·시행규칙을 구분한다. */
+function matchesCitedLawName(requested: string, official: string): boolean {
+  // 검색용 오타 보정이 올바른 정식 명칭까지 바꿀 수 있으므로 원문 동일성을 먼저 보존한다.
+  if (sameLawName(requested, official)) return true
+  const normalized = normalizeLawSearchText(requested)
+  const suffix = normalized.match(/^(.+?)\s*(시행령|시행규칙)$/)
+  const canonical = suffix
+    ? `${resolveLawAlias(suffix[1].trim()).canonical} ${suffix[2]}`
+    : resolveLawAlias(normalized).canonical
+  return sameLawName(normalized, official) || sameLawName(canonical, official)
 }
 
 /** 인용된 법령명 하나를 법제처 법령으로 특정한 결과. 같은 법령명의 인용들이 이 결과를 공유한다. */
@@ -261,7 +279,7 @@ async function resolveCitedLaw(
 ): Promise<LawResolution> {
   // 1단계: 법령 검색 — findLaws가 관련도 정렬까지 처리 (민법→난민법 오매칭 방지)
   // 앞 수식어가 남은 캡처("절도죄는 형법")도 후보를 순차 축약하며 실제 법령명을 찾는다.
-  let fallback: LawInfo | undefined   // 어떤 후보도 looseMatch 실패 시 ⚠ 메시지용 (전체 캡처 기준)
+  let fallback: LawInfo | undefined   // 어떤 후보도 동일성 확인 실패 시 ⚠ 메시지용 (전체 캡처 기준)
   // 후보가 하나도 없으면(접미사뿐인 캡처, #70) 검색을 시도하지 않는다 — 시도하면 무관 법령이
   // 물려오고, 검색 결과가 0이면 ✗ NOT_FOUND 로 낙인돼 '법령명 미상'이 '환각'으로 오보된다.
   // 꼬리 후보 중 첫 어절이 "관한·대한·및" 류면 법령명의 앞머리가 될 수 없다("관한 법률"·"및 안전관리에 관한 법률").
@@ -275,7 +293,8 @@ async function resolveCitedLaw(
       const results = await findLaws(apiClient, cand, apiKey, 5, 100)
       if (results.length === 0) continue
       if (!fallback) fallback = results[0]
-      if (looseMatchLawName(cand, results[0].lawName)) return { kind: "chosen", law: results[0] }
+      const chosen = results.find(law => matchesCitedLawName(cand, law.lawName))
+      if (chosen) return { kind: "chosen", law: chosen }
     }
     // 현행(target=law)에서 이 법령을 특정하지 못함 → 폐지된 법령인지 연혁(eflaw)에서 확인.
     // '지어낸 인용(환각)'과 '실존했으나 폐지된 법령'을 구분(존재≠생존).
@@ -285,7 +304,10 @@ async function resolveCitedLaw(
     // 조건으로 걸면 다어절 폐지 법령이 ⌛ 대신 ⚠로 강등된다(pickRepealed가 완전일치·
     // 접두만 허용해 꼬리 후보가 엉뚱한 폐지본을 물어올 여지는 없다).
     // 이 단계는 대개 "없음"으로 끝나 후보를 다 돈다(지어낸 인용). 순서대로 기다리지 않고 함께 묻고, 앞 후보를 우선한다.
-    const repealed = (await Promise.all(candidates.map(cand => findRepealedLaw(apiClient, cand, apiKey)))).find(Boolean)
+    const repealed = (await Promise.all(candidates.map(async cand => {
+      const law = await findRepealedLaw(apiClient, cand, apiKey)
+      return law && matchesCitedLawName(cand, law.lawName) ? law : undefined
+    }))).find(Boolean)
     if (repealed) return (await renamedLineage(apiClient, repealed, apiKey)) ?? { kind: "repealed", law: repealed }
     return fallback ? { kind: "loose_only", fallback } : { kind: "not_found" }
   } catch (e) {
@@ -339,11 +361,13 @@ async function articleRangeHint(apiClient: LawApiClient, mst: string, apiKey?: s
 interface VerifyMemo {
   resolveLaw(lawName: string): Promise<LawResolution>
   rangeHint(mst: string): Promise<string>
+  article(mst: string, joCode: string): Promise<string>
 }
 
 function createVerifyMemo(apiClient: LawApiClient, apiKey?: string): VerifyMemo {
   const laws = new Map<string, Promise<LawResolution>>()
   const ranges = new Map<string, Promise<string>>()
+  const articles = new Map<string, Promise<string>>()
   return {
     resolveLaw(lawName) {
       let p = laws.get(lawName)
@@ -358,6 +382,15 @@ function createVerifyMemo(apiClient: LawApiClient, apiKey?: string): VerifyMemo 
       if (!p) {
         p = articleRangeHint(apiClient, mst, apiKey)
         ranges.set(mst, p)
+      }
+      return p
+    },
+    article(mst, joCode) {
+      const key = `${mst}:${joCode}`
+      let p = articles.get(key)
+      if (!p) {
+        p = apiClient.getLawText({ mst, jo: joCode, apiKey })
+        articles.set(key, p)
       }
       return p
     },
@@ -398,7 +431,7 @@ async function identifiedByFirstCandidate(apiClient: LawApiClient, lawName: stri
   if (!first) return false
   try {
     const results = await findLaws(apiClient, first, apiKey, 5, 100)
-    return results.length > 0 && looseMatchLawName(first, results[0].lawName)
+    return results.some(law => matchesCitedLawName(first, law.lawName))
   } catch {
     throwIfRequestCancelled()
     return false
@@ -468,7 +501,7 @@ async function verifyOne(
 
   // 2단계: 해당 조문 조회 (raw JSON 필요 — getLawText tool 대신 apiClient 직접)
   try {
-    const jsonText = await apiClient.getLawText({ mst: chosen.mst, jo: cite.joCode, apiKey })
+    const jsonText = await memo.article(chosen.mst, cite.joCode)
     const json = JSON.parse(jsonText)
     const rawUnits = json?.법령?.조문?.조문단위
     const units = toArray<any>(rawUnits)
@@ -500,28 +533,61 @@ async function verifyOne(
       }
     }
 
-    if (cite.hang) {
+    let scope = found
+    let verifiedLabel = `${officialLabel}${joTitle}`
+    if (cite.hang !== undefined) {
       const rawHang = found.항
       const hangs = toArray<any>(rawHang)
       const hangNumbers = hangs
         .map((h: any) => parseHangNumber(h.항번호))
         .filter((n: number) => !isNaN(n))
 
-      if (hangNumbers.includes(cite.hang)) {
-        return `✓ ${officialLabel}${joTitle} 제${cite.hang}항 실존`
+      const hang = hangs.find((h: any) => parseHangNumber(h?.항번호) === cite.hang)
+      if (!hang) {
+        const maxHang = hangNumbers.length > 0 ? Math.max(...hangNumbers) : 0
+        // maxHang=0이면 파싱 실패 가능성 높음 — 조문 자체는 실존이므로 ⚠로 보고
+        if (maxHang === 0) {
+          return `⚠ ${officialLabel}${joTitle} 실존, 제${cite.hang}항 확인 실패 (API 응답 형식 이상)`
+        }
+        return `✗ ${officialLabel}${joTitle} — [NOT_FOUND] 제${cite.hang}항 없음 (최대 제${maxHang}항)`
       }
-      const maxHang = hangNumbers.length > 0 ? Math.max(...hangNumbers) : 0
-      // maxHang=0이면 파싱 실패 가능성 높음 — 조문 자체는 실존이므로 ⚠로 보고
-      if (maxHang === 0) {
-        return `⚠ ${officialLabel}${joTitle} 실존, 제${cite.hang}항 확인 실패 (API 응답 형식 이상)`
-      }
-      return `✗ ${officialLabel}${joTitle} — [NOT_FOUND] 제${cite.hang}항 없음 (최대 제${maxHang}항)`
+      scope = hang
+      verifiedLabel += ` 제${cite.hang}항`
     }
 
-    return `✓ ${officialLabel}${joTitle} 실존${cite.claimTitle ? " · 제목 일치" : ""}`
+    if (cite.ho !== undefined) {
+      const hoLabel = `제${cite.ho}호${cite.hoBranch ? `의${cite.hoBranch}` : ""}`
+      // 조문 직속 호가 아니라 번호 없는 단일 항이 컨테이너인 응답도 있다.
+      // 번호가 있는 항 안의 호는 항을 명시해야 한다 — 다른 항의 같은 호를 대신 인증하지 않는다.
+      if (cite.hang === undefined && toArray<any>(scope.호).length === 0) {
+        const hangs = toArray<any>(found.항)
+        if (hangs.length === 1 && !String(hangs[0]?.항번호 ?? "").trim()) {
+          scope = hangs[0]
+        } else if (hangs.some((h: any) => toArray<any>(h?.호).length > 0)) {
+          return `⚠ ${formatCitationLabel(cite, chosen.lawName)} — 항번호 미지정: 호가 속한 항을 명시해야 검증할 수 있습니다`
+        }
+      }
+      const keys = toArray<any>(scope?.호).map((h: any) => hoNumberKey(h?.호번호))
+      if (!keys.includes(`${cite.ho}:${cite.hoBranch || 0}`)) {
+        if (keys.length === 0 || keys.some(k => k === undefined)) {
+          return `⚠ ${verifiedLabel} 실존, ${hoLabel} 확인 실패 (API 응답의 호번호 구조 미확인)`
+        }
+        return `✗ ${verifiedLabel} — [NOT_FOUND] ${hoLabel} 없음`
+      }
+      verifiedLabel += ` ${hoLabel}`
+    }
+
+    if (cite.mok) return `⚠ ${verifiedLabel} 실존, ${cite.mok}목 미검증 (목 단위 검증 미지원)`
+    return `✓ ${verifiedLabel} 실존${cite.claimTitle ? " · 제목 일치" : ""}`
   } catch (e) {
     return `⚠ ${formatCitationLabel(cite, chosen.lawName)} — 조문 조회 실패: ${e instanceof Error ? e.message : String(e)}`
   }
+}
+
+/** 호번호는 '1.', '제1호', '1의2.' 등이다. 가지번호를 잘라 기본 호로 오인하지 않는다. */
+function hoNumberKey(raw: unknown): string | undefined {
+  const m = String(raw ?? "").trim().match(/^(?:제\s*)?(\d+)\s*(?:호\s*)?(?:의\s*(\d+))?\s*[.)]?$/)
+  return m ? `${parseInt(m[1], 10)}:${parseInt(m[2] || "0", 10)}` : undefined
 }
 
 /** 옛 법령명 인용 — 그 이름 시절 마지막 버전에서 조문을 확인하고 현행 명칭을 알린다. 번호 체계가 바뀌었을 수 있어 ✓ 대신 ⚠ */
